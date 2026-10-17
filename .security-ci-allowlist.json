@@ -1,0 +1,82 @@
+{
+  "_comment": "security-ci suppressions for shizuha-labs/id. PLAT-5530.",
+  "allowlist": [
+    {
+      "source_id": "security-ci:72f61c98032b46dfaf0202f3",
+      "tool": "semgrep",
+      "rule": "python.jwt.security.jwt-hardcode.jwt-python-hardcoded-secret",
+      "path_contains": "mcp-server/test_token_verifier.py",
+      "owner": "security@shizuha.com",
+      "disposition": "accepted-false-positive",
+      "reason": "Test deliberately signs HS256 with literal 'secret' to assert the RS256-only verifier rejects it. Not a runtime credential. PLAT-5530 / akira 2026-07-29.",
+      "approved_by": "security@shizuha.com",
+      "expires": "2099-12-31"
+    },
+    {
+      "source_id": "security-ci:1d75979fc23e925ca1b810c3",
+      "tool": "semgrep",
+      "rule": "yaml.github-actions.security.run-shell-injection.run-shell-injection",
+      "path_contains": ".forgejo/workflows/deploy-frontend.yml",
+      "owner": "security@shizuha.com",
+      "disposition": "accepted-false-positive",
+      "reason": "Workflow triggers only on protected main/master; interpolations are github.sha (hex) and event-derived protected ref, quoted in shell. No PR title/body/head-label. PLAT-5530.",
+      "approved_by": "security@shizuha.com",
+      "expires": "2099-12-31"
+    },
+    {
+      "source_id": "security-ci:e966c41f11f44b7abbb5b45f",
+      "tool": "semgrep",
+      "rule": "yaml.github-actions.security.run-shell-injection.run-shell-injection",
+      "path_contains": ".forgejo/workflows/deploy.yml",
+      "owner": "security@shizuha.com",
+      "disposition": "accepted-false-positive",
+      "reason": "Workflow triggers only on protected main/master; interpolations are github.sha (hex) and event-derived protected ref, quoted in shell. No PR title/body/head-label. PLAT-5530.",
+      "approved_by": "security@shizuha.com",
+      "expires": "2099-12-31"
+    },
+    {
+      "source_id": "security-ci:aed9c5a0821e060923252566",
+      "tool": "semgrep",
+      "rule": "yaml.github-actions.security.run-shell-injection.run-shell-injection",
+      "path_contains": ".forgejo/workflows/premerge.yml",
+      "owner": "security@shizuha.com",
+      "disposition": "accepted-false-positive",
+      "reason": "Premerge uses event-derived github.sha and Forgejo synthetic pull-request ref, both quoted; no PR-title/body/head-label context. PLAT-5530.",
+      "approved_by": "security@shizuha.com",
+      "expires": "2099-12-31"
+    },
+    {
+      "source_id": "security-ci:1a863988118ff438309deb1b",
+      "tool": "semgrep",
+      "rule": "yaml.github-actions.security.run-shell-injection.run-shell-injection",
+      "path_contains": ".forgejo/workflows/deploy.yml",
+      "owner": "security@shizuha.com",
+      "disposition": "accepted-false-positive",
+      "reason": "Workflow triggers only on protected main; interpolations are github.sha (hex) and event-derived protected ref, quoted in shell. Same construct as the existing deploy.yml run-shell-injection allowlist entry (PLAT-5530), new source_id from line shift. PLAT-6055.",
+      "approved_by": "security@shizuha.com",
+      "expires": "2099-12-31"
+    },
+    {
+      "source_id": "security-ci:f9fcb9f241bc8ac3b987fbc8",
+      "tool": "semgrep",
+      "rule": "yaml.github-actions.security.run-shell-injection.run-shell-injection",
+      "path_contains": ".forgejo/workflows/deploy.yml",
+      "owner": "security@shizuha.com",
+      "disposition": "accepted-false-positive",
+      "reason": "Workflow triggers only on protected main; interpolations are github.sha (hex) and event-derived protected ref, quoted in shell. No PR title/body/head-label. Same FP class as PLAT-5530/PLAT-6055/PLAT-6686 (deploy.yml line-shift from 211 to 193). PLAT-6308.",
+      "approved_by": "security@shizuha.com",
+      "expires": "2099-12-31"
+    },
+    {
+      "source_id": "security-ci:d153b2bbc521c8ad7248c757",
+      "tool": "semgrep",
+      "rule": "yaml.github-actions.security.run-shell-injection.run-shell-injection",
+      "path_contains": ".forgejo/workflows/deploy.yml",
+      "owner": "security@shizuha.com",
+      "disposition": "accepted-false-positive",
+      "reason": "Workflow triggers only on protected main; interpolations are github.sha (hex) and event-derived protected ref, quoted in shell. No PR title/body/head-label. Same FP class as PLAT-5530/PLAT-6055 (deploy.yml line-shift). PLAT-6686.",
+      "approved_by": "security@shizuha.com",
+      "expires": "2099-12-31"
+    }
+  ]
+}
