@@ -1,0 +1,6 @@
+# Shizuha MCP Server Dependencies
+mcp>=1.23.0,<2.0.0
+requests>=2.28.0
+idna>=3.15
+python-multipart>=0.0.32,<0.0.33
+PyJWT>=2.13.0

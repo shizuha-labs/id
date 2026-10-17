@@ -1,0 +1,428 @@
+# Shizuha Origin CI/CD — MULTI-ARCH build + deploy shizuha-id-FRONTEND (PLAT-1058).
+# The frontend is a separate image from the backend (deploy.yml builds the backend).
+# Self-contained: @shizuha/ui is installed from the in-cluster npm-cache (Verdaccio),
+# NOT file:/packages/shizuha-ui, so this standalone-repo CI can build it.
+# Multi-arch (amd64 s1 + arm64 gx10) — frontend must run on any cluster node.
+name: deploy-shizuha-id-frontend
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+    paths:
+      - 'frontend/**'
+      - '.forgejo/workflows/deploy-frontend.yml'
+      - '.forgejo/scripts/**'
+concurrency:
+  group: deploy-shizuha-id-frontend-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    container:
+      image: node:20-bookworm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Login copy must never paint machine codes or /account
+        shell: bash
+        run: |
+          set -euo pipefail
+          node frontend/src/utils/userFacingApiError.test.mjs
+          node frontend/scripts/loginCopy.guardrail.test.mjs
+  build-and-deploy:
+    needs: [quality]
+    runs-on: deploy-lane
+    steps:
+      - name: Checkout exact triggering revision for monotonic release guard
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH="$(uname -m)"; case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; *) echo "Unsupported runner arch: $KUBECTL_ARCH" >&2; exit 1;; esac
+          curl -fsSL -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          # The release observer reads Helm's stored values to distinguish a
+          # completed lifecycle reconcile from a merely-updated Deployment.
+          # This runner image does not include Helm, so install the reviewed
+          # Origin-hosted package before entering the bounded convergence loop.
+          HELM_VERSION=v3.16.4
+          curl -fsSL \
+            "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/helm/${HELM_VERSION}/helm-${HELM_VERSION}-linux-${KUBECTL_ARCH}.tar.gz" \
+            | tar xz
+          install -m 0755 "linux-${KUBECTL_ARCH}/helm" /usr/local/bin/helm
+          helm version --short | grep -F "${HELM_VERSION}"
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Multi-arch build + deploy + verify (frontend)
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          FTAG="id-frontend-${SHORT}"
+          REG="registry.registry.svc.cluster.local:5000"
+          echo "Multi-arch build shizuha-id-frontend:${FTAG} (amd64 + arm64)"
+
+          # A cancelled Actions container cannot terminate Jobs it created via
+          # kubectl. Reap only superseded ID frontend build artifacts before
+          # starting the authoritative revision.
+          mapfile -t STALE_ID_FRONTEND_JOBS < <(
+            kubectl get jobs -n build -o name | grep -E \
+              '^job.batch/(ci-build-id-frontend-|ci-manifest-id-frontend-|ci-verify-shizuha-id-frontend-)' || true
+          )
+          if [ "${#STALE_ID_FRONTEND_JOBS[@]}" -gt 0 ]; then
+            kubectl delete -n build "${STALE_ID_FRONTEND_JOBS[@]}" --wait=true --timeout=120s
+          fi
+
+          render_build_job() {  # $1=arch
+            local ARCH="$1"
+            cat <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-build-id-frontend-${SHORT}-${ARCH}
+            namespace: build
+            labels: { app: ci-build, service: id-frontend }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 1800
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: ${ARCH} }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                  # amd64 kaniko on i9-ws times out pushing to registry ClusterIP;
+                  # s1 overlay works and carries operator=unschedulable. CI tolerates
+                  # the operator-hold taint instead of removing it.
+                  - { key: operator, operator: Equal, value: unschedulable, effect: NoSchedule }
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+                        # i9-ws overlay to ns registry is i/o timeout. Keep excluded until
+                        # ClusterIP/FORWARD on i9-ws is actually fixed.
+                        - { key: kubernetes.io/hostname, operator: NotIn, values: [i9-ws] }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        mkdir -p /workspace/src
+                        cd /workspace/src
+                        git init
+                        git remote add origin http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/id.git
+                        git fetch --depth=1 origin "${{ github.ref }}"
+                        git checkout --detach FETCH_HEAD
+                        test "\$(git rev-parse HEAD)" = "${{ github.sha }}"
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=dir:///workspace/src
+                      - --dockerfile=/workspace/src/frontend/Dockerfile.ci
+                      - --destination=${REG}/shizuha-id-frontend:${FTAG}-${ARCH}
+                      - --cleanup
+                      - --insecure
+                      - --skip-tls-verify
+                      - --insecure-pull
+                      - --registry-mirror=mirror-dockerhub.registry.svc.cluster.local:5000
+                      - --build-arg=NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/
+                      - --build-arg=VITE_BASE_PATH=/id/
+                      - --build-arg=VITE_API_BASE=/id/api
+                      - --cache=true
+                      - --cache-repo=${REG}/kaniko-cache/id-deploy-frontend-${ARCH}
+                      - --cache-copy-layers=true
+                      - --cache-ttl=336h
+                      - --compressed-caching=false
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          }
+
+          BUILD_GUARD_CONFIGMAP="origin-ci-build-guard-650fec631781"
+          BUILD_GUARD_SHA256="650fec631781edce0e4980f0fb07b12ab78b67b1faf780b214d12a40f9dddcf6"
+          BUILD_GUARD="${RUNNER_TEMP:-/tmp}/origin-ci-build-guard.py"
+          kubectl get "configmap/${BUILD_GUARD_CONFIGMAP}" -n origin \
+            -o jsonpath='{.data.guard\.py}' >"$BUILD_GUARD"
+          echo "${BUILD_GUARD_SHA256}  ${BUILD_GUARD}" | sha256sum -c -
+          job_name_for_arch() {
+            local ARCH="$1"
+            render_build_job "$ARCH" | awk '$1 == "name:" { print $2; exit }'
+          }
+          AMD64_JOB="$(job_name_for_arch amd64)"
+          ARM64_JOB="$(job_name_for_arch arm64)"
+          test -n "$AMD64_JOB" -a -n "$ARM64_JOB"
+          cleanup_build_pair() {
+            python3 "$BUILD_GUARD" cleanup \
+              --namespace build --job "$AMD64_JOB" --job "$ARM64_JOB"
+          }
+          cleanup_on_failure() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then cleanup_build_pair || true; fi
+            exit "$rc"
+          }
+          trap cleanup_on_failure EXIT INT TERM
+          python3 "$BUILD_GUARD" preflight --arch amd64 --arch arm64
+          cleanup_build_pair
+          render_build_job amd64 | kubectl apply -f -
+          render_build_job arm64 | kubectl apply -f -
+          python3 "$BUILD_GUARD" wait-pair --namespace build \
+            --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
+            --timeout-seconds 1800
+          trap - EXIT INT TERM
+
+          wait_job() {
+            local ARCH="$1"
+            local JOB="ci-build-id-frontend-${SHORT}-${ARCH}"
+            kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=1800s &
+            local WP=$!
+            while kill -0 "$WP" 2>/dev/null; do
+              if kubectl get "job/${JOB}" -n build -o jsonpath='{.status.failed}' | grep -q '[1-9]'; then
+                echo "::error::kaniko frontend ${ARCH} build failed"
+                kubectl logs -n build "job/${JOB}" --all-containers --tail=80 || true
+                exit 1
+              fi
+              sleep 5
+            done
+            wait "$WP"
+          }
+          wait_job amd64 &
+          WAIT_AMD64_PID=$!
+          wait_job arm64 &
+          WAIT_ARM64_PID=$!
+          WAIT_FAILED=0
+          wait "${WAIT_AMD64_PID}" || WAIT_FAILED=1
+          wait "${WAIT_ARM64_PID}" || WAIT_FAILED=1
+          if [ "${WAIT_FAILED}" -ne 0 ]; then
+            exit 1
+          fi
+
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-manifest-id-frontend-${SHORT}
+            namespace: build
+            labels: { app: ci-manifest, service: id-frontend }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 300
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: crane
+                    image: gcr.io/go-containerregistry/crane:latest
+                    args:
+                      - index
+                      - append
+                      - --insecure
+                      - -t
+                      - ${REG}/shizuha-id-frontend:${FTAG}
+                      - -m
+                      - ${REG}/shizuha-id-frontend:${FTAG}-amd64
+                      - -m
+                      - ${REG}/shizuha-id-frontend:${FTAG}-arm64
+          YAML
+          kubectl wait -n build --for=condition=complete "job/ci-manifest-id-frontend-${SHORT}" --timeout=300s || {
+            echo "::error::frontend manifest combine failed"
+            kubectl logs -n build "job/ci-manifest-id-frontend-${SHORT}" --tail=80 || true
+            exit 1
+          }
+
+          verify_manifest() {
+            local REPO="$1"
+            local IMAGE_TAG="$2"
+            local JOB="ci-verify-${REPO}-${SHORT}"
+            cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-verify, service: ${REPO} }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 180
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: manifest-check
+                    image: python:3.12-alpine
+                    command: ["python", "-c"]
+                    args:
+                      - |
+                        import json, urllib.request
+                        url = "http://${REG}/v2/${REPO}/manifests/${IMAGE_TAG}"
+                        accept = ",".join([
+                            "application/vnd.oci.image.index.v1+json",
+                            "application/vnd.docker.distribution.manifest.list.v2+json",
+                        ])
+                        req = urllib.request.Request(url, headers={"Accept": accept})
+                        with urllib.request.urlopen(req, timeout=30) as resp:
+                            manifest = json.load(resp)
+                        platforms = {
+                            f"{m.get('platform', {}).get('os')}/{m.get('platform', {}).get('architecture')}"
+                            for m in manifest.get("manifests", [])
+                        }
+                        missing = {"linux/amd64", "linux/arm64"} - platforms
+                        print(f"{url} platforms={sorted(platforms)}")
+                        if missing:
+                            raise SystemExit(f"missing required platform(s): {sorted(missing)}")
+          YAML
+            kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=120s || {
+              echo "::error::manifest verification failed"
+              kubectl logs -n build "job/${JOB}" --tail=80 || true
+              exit 1
+            }
+            kubectl logs -n build "job/${JOB}" --tail=20 || true
+          }
+          verify_manifest "shizuha-id-frontend" "${FTAG}"
+          python3 .forgejo/scripts/test_deploy_values_path.py
+          set +e
+          .forgejo/scripts/monotonic-release-guard.sh shizuha shizuha-id-frontend "${{ github.sha }}"
+          GUARD_RC="$?"
+          set -e
+          if [ "${GUARD_RC}" = 10 ]; then exit 0; fi
+          if [ "${GUARD_RC}" != 0 ]; then exit "${GUARD_RC}"; fi
+
+          # Promote the immutable frontend tag to the canonical chart before
+          # touching the cluster. Retry only optimistic-lock conflicts: backend
+          # CI may update image.tag in the same values file at the same time.
+          FGJO_URL="http://forgejo-http.origin.svc.cluster.local"
+          FGJO_HOST="origin.shizuha.com"
+          VALS_URL="${FGJO_URL}/api/v1/repos/shizuha-labs/deploy/contents/k3s%2Fcharts%2Fshizuha-id%2Fvalues.yaml"
+          PROMOTED=false
+          for write_attempt in 1 2 3 4 5; do
+            GET_CODE="$(curl -sS -o /tmp/id-frontend-values.json -w '%{http_code}' \
+              -H "Host: ${FGJO_HOST}" \
+              -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+              "${VALS_URL}" || true)"
+            test "${GET_CODE}" = 200 || {
+              echo "::error::deploy values GET returned HTTP ${GET_CODE}"; exit 1;
+            }
+            FILE_SHA="$(python3 -c 'import json; print(json.load(open("/tmp/id-frontend-values.json"))["sha"])')"
+            python3 -c 'import base64,json; open("/tmp/id-values.yaml","wb").write(base64.b64decode(json.load(open("/tmp/id-frontend-values.json"))["content"]))'
+            CURRENT_FRONTEND_TAG="$(python3 .forgejo/scripts/deploy-values-path.py get /tmp/id-values.yaml frontend.image.tag)"
+            if [ "${CURRENT_FRONTEND_TAG}" = "${FTAG}" ]; then
+              echo "deploy repo already desires ${FTAG}"
+              break
+            fi
+            python3 .forgejo/scripts/deploy-values-path.py set /tmp/id-values.yaml frontend.image.tag "${FTAG}" >/dev/null
+            NEW_B64="$(base64 -w0 /tmp/id-values.yaml)"
+            BODY="$(python3 -c "import json,sys; print(json.dumps({'message':'ci(shizuha-id): desired frontend tag ${FTAG} before rollout','content':sys.argv[1],'sha':'${FILE_SHA}','branch':'master','committer':{'email':'ci@shizuha.com','name':'Origin CI'}}))" "${NEW_B64}")"
+            PUT_CODE="$(curl -sS -o /tmp/id-frontend-values-put.json -w '%{http_code}' \
+              -X PUT -H "Host: ${FGJO_HOST}" \
+              -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+              -H 'Content-Type: application/json' \
+              "${VALS_URL}" -d "${BODY}" || true)"
+            if printf '%s' "${PUT_CODE}" | grep -Eq '^(200|201)$'; then
+              PROMOTED=true
+              echo "deploy repo desired frontend tag updated to ${FTAG}"
+              break
+            fi
+            if [ "${PUT_CODE}" = 409 ] && [ "${write_attempt}" != 5 ]; then
+              echo "deploy values changed concurrently; retrying fresh read (${write_attempt}/5)"
+              sleep 2
+              continue
+            fi
+            echo "::error::deploy values PUT returned HTTP ${PUT_CODE}"; exit 1
+          done
+          GET_CODE="$(curl -sS -o /tmp/id-frontend-values-final.json -w '%{http_code}' \
+            -H "Host: ${FGJO_HOST}" \
+            -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+            "${VALS_URL}" || true)"
+          test "${GET_CODE}" = 200 || { echo "::error::deploy values verification GET returned HTTP ${GET_CODE}"; exit 1; }
+          python3 -c 'import base64,json; open("/tmp/id-values-final.yaml","wb").write(base64.b64decode(json.load(open("/tmp/id-frontend-values-final.json"))["content"]))'
+          FINAL_FRONTEND_TAG="$(python3 .forgejo/scripts/deploy-values-path.py get /tmp/id-values-final.yaml frontend.image.tag)"
+          test "${FINAL_FRONTEND_TAG}" = "${FTAG}" || { echo "::error::deploy repo frontend tag ${FINAL_FRONTEND_TAG} != ${FTAG}"; exit 1; }
+
+          # If a prior lifecycle failed after this immutable tag was promoted,
+          # a rerun has no chart diff to generate another push event. Request a
+          # reconcile explicitly so chart/live drift is still self-healing.
+          if [ "${PROMOTED}" != true ]; then
+            DISPATCH_CODE="$(curl -sS -o /tmp/id-frontend-dispatch.json -w '%{http_code}' \
+              -X POST -H "Host: ${FGJO_HOST}" \
+              -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+              -H 'Content-Type: application/json' \
+              "${FGJO_URL}/api/v1/repos/shizuha-labs/deploy/actions/workflows/deploy-id-mail-lifecycle.yml/dispatches" \
+              -d '{"ref":"master"}' || true)"
+            test "${DISPATCH_CODE}" = 204 || { echo "::error::lifecycle dispatch returned HTTP ${DISPATCH_CODE}"; exit 1; }
+            echo "central lifecycle reconcile dispatched for existing desired tag ${FTAG}"
+          fi
+
+          # The central lifecycle is the sole Helm/workload writer. Wait for it
+          # to consume this canonical chart commit instead of mutating a
+          # Helm-managed Deployment directly.
+          EXPECTED_FRONTEND_IMAGE="localhost:30500/shizuha-id-frontend:${FTAG}"
+          deployment_converged() {
+            kubectl get deploy -n shizuha "$1" -o json 2>/dev/null | python3 -c '
+          import json, sys
+          deployment = json.load(sys.stdin)
+          metadata, spec, status = deployment["metadata"], deployment["spec"], deployment.get("status", {})
+          replicas = spec.get("replicas", 1)
+          ok = (
+              status.get("observedGeneration", 0) >= metadata.get("generation", 0)
+              and status.get("updatedReplicas", 0) == replicas
+              and status.get("availableReplicas", 0) == replicas
+              and status.get("readyReplicas", 0) == replicas
+          )
+          raise SystemExit(0 if ok else 1)
+          '
+          }
+          for attempt in $(seq 1 540); do
+            GET_CODE="$(curl -sS -o /tmp/id-frontend-values-current.json -w '%{http_code}' \
+              -H "Host: ${FGJO_HOST}" \
+              -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+              "${VALS_URL}" || true)"
+            CURRENT_DESIRED_FRONTEND=""
+            if [ "${GET_CODE}" = 200 ]; then
+              python3 -c 'import base64,json; open("/tmp/id-values-current.yaml","wb").write(base64.b64decode(json.load(open("/tmp/id-frontend-values-current.json"))["content"]))'
+              CURRENT_DESIRED_FRONTEND="$(python3 .forgejo/scripts/deploy-values-path.py get /tmp/id-values-current.yaml frontend.image.tag)"
+            fi
+            if [ -n "${CURRENT_DESIRED_FRONTEND}" ] && [ "${CURRENT_DESIRED_FRONTEND}" != "${FTAG}" ]; then
+              echo "Frontend desired state advanced to ${CURRENT_DESIRED_FRONTEND}; this run is superseded"
+              exit 0
+            fi
+            LIVE="$(kubectl get deploy -n shizuha shizuha-id-frontend -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+            STORED_FRONTEND_TAG="$(helm get values shizuha-id -n shizuha -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("frontend",{}).get("image",{}).get("tag",""))' || true)"
+            if [ "${LIVE}" = "${EXPECTED_FRONTEND_IMAGE}" ] \
+              && [ "${STORED_FRONTEND_TAG}" = "${FTAG}" ] \
+              && deployment_converged shizuha-id-frontend; then
+              echo "Chart, Helm, and frontend converged on attempt ${attempt}"
+              break
+            fi
+            if [ "${attempt}" = 540 ]; then
+              echo "::error::central lifecycle did not converge ID frontend"; exit 1
+            fi
+            sleep 5
+          done
+          # Re-read the declarative tag after rollout so a concurrent backend
+          # promotion cannot leave the live image ahead of the chart.
+          GET_CODE="$(curl -sS -o /tmp/id-frontend-values-final.json -w '%{http_code}' \
+            -H "Host: ${FGJO_HOST}" \
+            -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+            "${VALS_URL}" || true)"
+          test "${GET_CODE}" = 200 || { echo "::error::post-rollout deploy values GET returned HTTP ${GET_CODE}"; exit 1; }
+          python3 -c 'import base64,json; open("/tmp/id-values-final.yaml","wb").write(base64.b64decode(json.load(open("/tmp/id-frontend-values-final.json"))["content"]))'
+          FINAL_FRONTEND_TAG="$(python3 .forgejo/scripts/deploy-values-path.py get /tmp/id-values-final.yaml frontend.image.tag)"
+          test "${FINAL_FRONTEND_TAG}" = "${FTAG}" || { echo "::error::post-rollout deploy repo frontend tag ${FINAL_FRONTEND_TAG} != ${FTAG}"; exit 1; }
+          kubectl annotate -n shizuha deploy/shizuha-id-frontend shizuha.io/last-successful-sha="${{ github.sha }}" --overwrite
+          kubectl get pods -n shizuha -l app=shizuha-id-frontend

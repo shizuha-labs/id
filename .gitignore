@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+
+# Django
+*.log
+*.pot
+*.pyc
+db.sqlite3
+db.sqlite3-journal
+media/
+static/
+staticfiles/
+local_settings.py
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Firebase credentials
+firebase-adminsdk.json
+
+# Celery
+celerybeat-schedule
+celerybeat-schedule.db
+celerybeat.pid
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Sphinx documentation
+docs/_build/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.cache/
+frontend/test-results/
+frontend/playwright-report/
+npm-debug.log*
+yarn-error.log*
+yarn-debug.log*
+
+# Local environments, caches, and editor scratch (never commit)
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.claude/

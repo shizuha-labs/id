@@ -1,0 +1,150 @@
+# ORIG-18: PR-gating test job. Byte-identical to deploy.yml's `migration-gate` job but
+# triggered on pull_request, so Forgejo branch protection can require the
+# context `premerge / migration-gate (pull_request)` before any merge — the platform-
+# native fix for the PR-merge gate-bypass hole (PLAT-4516). Keep in sync with
+# deploy.yml when its job changes.
+name: premerge
+on:
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  migration-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH="$(uname -m)"; case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; *) echo "Unsupported runner arch: $KUBECTL_ARCH" >&2; exit 1;; esac
+          curl -fsSL -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Run full Django test + migration gate before merge
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          JOB="ci-migration-gate-id-${SHORT}"
+          kubectl delete job -n build "${JOB}" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-migration-gate, service: id, shizuha.io/orig-task: ORIG-21 }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 900
+            template:
+              spec:
+                restartPolicy: Never
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                        - matchExpressions:
+                            # i9-ws has a broken control-plane path (PLAT-7038) —
+                            # migration-gate Jobs must not schedule there or they
+                            # hang (can't reach the API server / cluster services).
+                            - { key: kubernetes.io/hostname, operator: NotIn, values: [i9-ws] }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        mkdir -p /workspace/src
+                        cd /workspace/src
+                        git init
+                        git remote add origin http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/id.git
+                        git fetch --depth=1 origin "${{ github.ref }}"
+                        git checkout --detach FETCH_HEAD
+                        test "\$(git rev-parse HEAD)" = "${{ github.sha }}"
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: migration-gate
+                    # Match the production image interpreter so its cached wheels
+                    # are reusable; a different ABI turns every gate into a cold WAN fill.
+                    image: python:3.11-bookworm
+                    command: ["/bin/bash","-lc"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        export DEBIAN_FRONTEND=noninteractive PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=5 UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=5
+                        retry() {
+                          local attempt=1
+                          while ! "\$@"; do
+                            if [ "\$attempt" -ge 3 ]; then
+                              echo "dependency command failed after \${attempt} attempts: \$*" >&2
+                              return 1
+                            fi
+                            echo "dependency command failed; retrying in \$((attempt * 10))s (\${attempt}/3): \$*" >&2
+                            sleep \$((attempt * 10))
+                            attempt=\$((attempt + 1))
+                          done
+                        }
+                        apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 update
+                        apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 install -y --no-install-recommends postgresql redis-server build-essential libpq-dev
+                        pg_ctlcluster 15 main start
+                        su postgres -c "psql -c \"ALTER USER postgres PASSWORD 'postgres';\""
+                        su postgres -c "createdb shizuha_id_ci" || true
+                        redis-server --daemonize yes
+                        cd /workspace/src
+                        retry python -m pip install --index-url http://pip-cache.registry.svc.cluster.local/simple --trusted-host pip-cache.registry.svc.cluster.local --upgrade pip
+                        retry python -m pip install --index-url http://pip-cache.registry.svc.cluster.local/simple --trusted-host pip-cache.registry.svc.cluster.local uv==0.11.26
+                        # The canonical lock records PyPI provenance while the runner
+                        # installs through the internal mirror.  --locked attempts a
+                        # provenance-sensitive re-lock and false-fails; --frozen uses
+                        # the committed lock as the exact source of truth.
+                        # MAIL-74 / ren P2: still require lock freshness against
+                        # public PyPI provenance before the frozen mirror install.
+                        # Unset internal index env so uv lock --check does not
+                        # false-fail on mirror provenance drift.
+                        env -u PIP_INDEX_URL -u PIP_TRUSTED_HOST -u UV_INDEX_URL -u UV_DEFAULT_INDEX \
+                          uv lock --check
+                        retry uv sync --frozen --extra dev --no-install-project --no-editable --index-url http://pip-cache.registry.svc.cluster.local/simple --allow-insecure-host pip-cache.registry.svc.cluster.local
+                        export PATH="/workspace/src/.venv/bin:$PATH"
+                        export POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres POSTGRES_DB=shizuha_id_ci
+                        export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_PASSWORD=postgres DB_NAME=shizuha_id_ci
+                        export REDIS_URL=redis://127.0.0.1:6379/5 CACHE_REDIS_URL=redis://127.0.0.1:6379/6 DEBUG=True SECRET_KEY=ci-secret JWT_SECRET_KEY=ci-secret SHIZUHA_JWT_SIGNING_KEY=ci-secret
+                        # PLAT-7084: build-ns cannot resolve service short names.
+                        # Pin the mail API to the cluster FQDN so password-reset
+                        # and step-up mail calls do not NameResolutionError.
+                        export SHIZUHA_MAIL_API_URL=http://shizuha-mail.shizuha.svc.cluster.local:8014
+                        # Cortex short-name check (PLAT-7084, reika 6646): not this Job.
+                        # shizuha-labs/cortex@master inference/authentication.py:163 and
+                        # inference/admin_views.py:1308 still default SHIZUHA_EXPECTED_ISSUER
+                        # to http://shizuha-id:8001. admin_views.py:1325 disables live
+                        # username lookups when sys.argv[1]=='test', so the cortex
+                        # Django gate does not resolve that short name. No cortex
+                        # FQDN override in this change.
+                        python manage.py makemigrations --check --dry-run
+                        python .forgejo/scripts/check-django-migration-graph.py
+                        echo "== ID-68 default-on full identity suite with exact failure ratchet =="
+                        python ci/run_identity_test_gate.py --verbosity 1
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=1800s &
+          WP=$!
+          while kill -0 "$WP" 2>/dev/null; do
+            if kubectl get -n build "job/${JOB}" -o jsonpath='{.status.failed}' 2>/dev/null | grep -q '[1-9]'; then
+              echo "::error::Django test/migration gate failed"
+              kubectl logs -n build "job/${JOB}" --all-containers --tail=200 || true
+              kill "$WP" 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          wait "$WP" || {
+            echo "::error::Django test/migration gate failed (timeout)"
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=200 || true
+            exit 1
+          }
+          kubectl logs -n build "job/${JOB}" --all-containers --tail=120 || true

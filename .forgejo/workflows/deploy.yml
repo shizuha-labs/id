@@ -1,0 +1,654 @@
+# Shizuha Origin CI/CD — MULTI-ARCH build + deploy id (ORIG-7 Plan A).
+# Lives in the id repo; triggers on its own pushes (synced GitHub->Origin every 5m).
+# Builds id for BOTH amd64 + arm64 via two in-cluster kaniko Jobs (arch-matched nodes),
+# combines them into a multi-arch manifest list with crane, deploys the list, and verifies.
+# Multi-arch = the image runs on any platform node (s1 amd64 OR gx10 arm64) per PLAT-718 —
+# no single-arch regression / exec-format crashes. Auth = KUBE_CONFIG_B64 org secret
+# (least-privilege origin-ci-deployer SA). No submodule checkout, no docker-in-DinD.
+name: deploy-id
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+    # Forgejo supports on.push.paths (allowlist form only). Frontend-only and
+    # docs-only commits are shipped by deploy-frontend.yml, so this backend
+    # pipeline rebuilds + reruns the suite only when a backend-relevant path
+    # changes. Conservative by design: when unsure whether a path affects the
+    # backend image/tests, INCLUDE it here (fail-safe = rebuild, never skip).
+    paths:
+      - '.forgejo/workflows/deploy.yml'
+      - '.forgejo/scripts/**'
+      - 'Dockerfile*'
+      - '.dockerignore'
+      - 'supervisord.conf'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'manage.py'
+      - 'identity/**'
+      - 'shizuha_id/**'
+      - 'mcp-server/**'
+      - 'scripts/**'
+# migration-gate cancels on new push (fast feedback for gating failures).
+# The dedicated deploy lane owns the bounded build, gate, and rollout
+# orchestrators; unrelated test-only workflows must use general runners.
+# (The GitHub->Origin pull-sync also collapses rapid commits to one run per cycle.)
+concurrency:
+  group: deploy-id-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  migration-gate:
+    # Gate the exact immutable image that will be deployed. The previous gate
+    # cloned source and reinstalled the entire lock in a second Python image;
+    # dependency transport could outlive a cancelled Actions run indefinitely.
+    needs: build
+    runs-on: deploy-lane
+    container:
+      image: registry.registry.svc.cluster.local:5000/origin-ci-helm@sha256:90f02d48d68c0ed690f9ddd8bcef1167490610362c19d429943931433ed7b194
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          # Pinned toolbox vendors the client; do not download it per job.
+          kubectl version --client -o json | python3 -c 'import json,sys; assert json.load(sys.stdin)["clientVersion"]["gitVersion"].split("+")[0] == "v1.34.6"'
+          helm version --short | grep -F 'v3.21.2'
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Run Django migration graph gate before deploy
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          JOB="ci-migration-gate-id-${SHORT}"
+          TAG="id-${SHORT}"
+          # Forgejo cancellation cannot own or terminate Jobs created through
+          # kubectl. Concurrency guarantees only this revision is authoritative,
+          # so reap every superseded ID gate before creating the current one.
+          kubectl delete job -n build -l app=ci-migration-gate,service=id \
+            --ignore-not-found --wait=true --timeout=120s
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-migration-gate, service: id, shizuha.io/orig-task: ORIG-21 }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 1200
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                # Native sidecars are stable in Kubernetes 1.33. They give the
+                # candidate isolated test services without installing 300MiB of
+                # Debian packages on every commit, and do not block Job completion.
+                initContainers:
+                  - name: postgres
+                    image: localhost:30500/hive-ci-postgres:16-alpine
+                    restartPolicy: Always
+                    env:
+                      - { name: POSTGRES_USER, value: postgres }
+                      - { name: POSTGRES_PASSWORD, value: postgres }
+                      - { name: POSTGRES_DB, value: shizuha_id_ci }
+                    startupProbe:
+                      exec: { command: ["pg_isready", "-U", "postgres", "-d", "shizuha_id_ci"] }
+                      periodSeconds: 1
+                      failureThreshold: 60
+                  - name: redis
+                    image: localhost:30500/hive-ci-redis:7-alpine
+                    restartPolicy: Always
+                    args: ["redis-server", "--save", "", "--appendonly", "no"]
+                    startupProbe:
+                      exec: { command: ["redis-cli", "ping"] }
+                      periodSeconds: 1
+                      failureThreshold: 60
+                containers:
+                  - name: migration-gate
+                    # kubelet cannot resolve ClusterIP service DNS while pulling;
+                    # use the node-local registry endpoint for the same manifest.
+                    image: localhost:30500/shizuha-id:${TAG}
+                    imagePullPolicy: Always
+                    command: ["/bin/bash","-lc"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        # bash -l resets the image ENV PATH via /etc/profile.
+                        export PATH="/app/.venv/bin:\$PATH"
+                        # retry() helper — identical to premerge.yml. The ID-68
+                        # full-suite gate installs test-only dev deps (fakeredis)
+                        # not baked into the production image; the pip-cache can
+                        # transiently fail, so retry like premerge does.
+                        retry() {
+                          local attempt=1
+                          while ! "\$@"; do
+                            if [ "\$attempt" -ge 3 ]; then
+                              echo "dependency command failed after \${attempt} attempts: \$*" >&2
+                              return 1
+                            fi
+                            echo "dependency command failed; retrying in \$((attempt * 10))s (\${attempt}/3): \$*" >&2
+                            sleep \$((attempt * 10))
+                            attempt=\$((attempt + 1))
+                          done
+                        }
+                        # ID-68: the full identity suite (incl. tenant_rate_limit)
+                        # needs test-only dev deps (fakeredis) not baked into the
+                        # production image — install them here for the gate only.
+                        # The production image is built with the committed lock in
+                        # --no-dev mode and has NO pip in the venv, so use uv pip
+                        # install (uv is baked into the image) instead of python -m pip.
+                        retry uv pip install --python /app/.venv/bin/python --index-url http://pip-cache.registry.svc.cluster.local/simple --trusted-host pip-cache.registry.svc.cluster.local 'fakeredis[lua]>=2.0.0'
+                        python manage.py makemigrations --check --dry-run
+                        python .forgejo/scripts/check-django-migration-graph.py
+                        echo "== ID-68 default-on full identity suite with exact failure ratchet =="
+                        python ci/run_identity_test_gate.py --verbosity 1
+                        python mcp-server/test_token_verifier.py -v
+                    env:
+                      - { name: POSTGRES_HOST, value: "127.0.0.1" }
+                      - { name: POSTGRES_PORT, value: "5432" }
+                      - { name: POSTGRES_USER, value: postgres }
+                      - { name: POSTGRES_PASSWORD, value: postgres }
+                      - { name: POSTGRES_DB, value: shizuha_id_ci }
+                      - { name: DB_HOST, value: "127.0.0.1" }
+                      - { name: DB_PORT, value: "5432" }
+                      - { name: DB_USER, value: postgres }
+                      - { name: DB_PASSWORD, value: postgres }
+                      - { name: DB_NAME, value: shizuha_id_ci }
+                      - { name: REDIS_URL, value: "redis://127.0.0.1:6379/5" }
+                      - { name: CACHE_REDIS_URL, value: "redis://127.0.0.1:6379/6" }
+                      - { name: DEBUG, value: "True" }
+                      - { name: SECRET_KEY, value: ci-secret }
+                      - { name: JWT_SECRET_KEY, value: ci-secret }
+                      - { name: SHIZUHA_JWT_SIGNING_KEY, value: ci-secret }
+                      # PLAT-7084: build-ns cannot resolve service short names.
+                      - { name: SHIZUHA_MAIL_API_URL, value: "http://shizuha-mail.shizuha.svc.cluster.local:8014" }
+                      # Cortex short-name check is recorded in premerge.yml (reika 6646).
+          YAML
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=1200s &
+          WP=$!
+          while kill -0 "$WP" 2>/dev/null; do
+            if kubectl get -n build "job/${JOB}" -o jsonpath='{.status.failed}' 2>/dev/null | grep -q '[1-9]'; then
+              echo "::error::Django test/migration gate failed"
+              kubectl logs -n build "job/${JOB}" --all-containers --tail=200 || true
+              kill "$WP" 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          wait "$WP" || {
+            echo "::error::Django test/migration gate failed (timeout)"
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=200 || true
+            exit 1
+          }
+          kubectl logs -n build "job/${JOB}" --all-containers --tail=120 || true
+  # Build and push the immutable multi-arch candidate first; migration-gate
+  # exercises this exact artifact without a second dependency installation.
+  build:
+    runs-on: deploy-lane
+    container:
+      image: registry.registry.svc.cluster.local:5000/origin-ci-helm@sha256:90f02d48d68c0ed690f9ddd8bcef1167490610362c19d429943931433ed7b194
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          # Pinned toolbox vendors the client; do not download it per job.
+          kubectl version --client -o json | python3 -c 'import json,sys; assert json.load(sys.stdin)["clientVersion"]["gitVersion"].split("+")[0] == "v1.34.6"'
+          helm version --short | grep -F 'v3.21.2'
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Multi-arch build + verify
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          TAG="id-${SHORT}"
+          REG="registry.registry.svc.cluster.local:5000"
+          NPM_CONFIG_REGISTRY="${NPM_CONFIG_REGISTRY:-http://npm-cache.registry.svc.cluster.local:4873/}"
+          PIP_INDEX_URL="${PIP_INDEX_URL:-http://pip-cache.registry.svc.cluster.local/simple/}"
+          PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-pip-cache.registry.svc.cluster.local}"
+          echo "Multi-arch build shizuha-id:${TAG} (amd64 + arm64)"
+
+          # Action cancellation does not propagate to Jobs created through
+          # kubectl. Reap only this workflow's prior backend build artifacts;
+          # the top-level concurrency group makes the current SHA authoritative.
+          mapfile -t STALE_ID_JOBS < <(
+            kubectl get jobs -n build -o name | grep -E \
+              '^job\.batch/(ci-build-id-[0-9a-f]{7}-(amd64|arm64)|ci-manifest-id-[0-9a-f]{7}|ci-verify-shizuha-id-[0-9a-f]{7})$' || true
+          )
+          if [ "${#STALE_ID_JOBS[@]}" -gt 0 ]; then
+            kubectl delete -n build "${STALE_ID_JOBS[@]}" --wait=true --timeout=120s
+          fi
+
+          render_build_job() {  # $1=arch
+            local ARCH="$1"
+            cat <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-build-id-${SHORT}-${ARCH}
+            namespace: build
+            labels: { app: ci-build, service: id, shizuha.io/orig-task: ORIG-7 }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 1800
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: ${ARCH} }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                  # amd64 kaniko on i9-ws times out pushing to registry ClusterIP;
+                  # s1 overlay works and carries operator=unschedulable. CI tolerates
+                  # the operator-hold taint instead of removing it.
+                  - { key: operator, operator: Equal, value: unschedulable, effect: NoSchedule }
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+                        # i9-ws overlay to ns registry is i/o timeout. Keep excluded until
+                        # ClusterIP/FORWARD on i9-ws is actually fixed.
+                        - { key: kubernetes.io/hostname, operator: NotIn, values: [i9-ws] }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        mkdir -p /workspace/src
+                        cd /workspace/src
+                        git init
+                        git remote add origin http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/id.git
+                        git fetch --depth=1 origin "${{ github.ref }}"
+                        git checkout --detach FETCH_HEAD
+                        test "\$(git rev-parse HEAD)" = "${{ github.sha }}"
+                        if [ -f /workspace/src/Dockerfile ]; then
+                          awk '''
+                            /^FROM[[:space:]]/ {
+                              print
+                              print "ARG NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/"
+                              print "ARG PIP_INDEX_URL=http://pip-cache.registry.svc.cluster.local/simple/"
+                              print "ARG PIP_TRUSTED_HOST=pip-cache.registry.svc.cluster.local"
+                              print "ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}"
+                              print "ENV PIP_INDEX_URL=${PIP_INDEX_URL}"
+                              print "ENV PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}"
+                              next
+                            }
+                            { print }
+                          ''' /workspace/src/Dockerfile > /workspace/src/Dockerfile.cache-wired
+                          mv /workspace/src/Dockerfile.cache-wired /workspace/src/Dockerfile
+                        fi
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    resources:
+                      requests: { cpu: 25m, memory: 64Mi }
+                      limits: { cpu: 1, memory: 512Mi }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=dir:///workspace/src
+                      - --dockerfile=/workspace/src/Dockerfile
+                      - --destination=${REG}/shizuha-id:${TAG}-${ARCH}
+                      - --cleanup
+                      - --insecure
+                      - --skip-tls-verify
+                      - --insecure-pull
+                      - --registry-mirror=mirror-dockerhub.registry.svc.cluster.local:5000
+                      # --registry-mirror only covers Docker Hub; the Dockerfile also pulls
+                      # ghcr.io/astral-sh/uv (kaniko fetched it direct + flaked 2026-07-12).
+                      # Map ghcr.io to the in-cluster pull-through proxy so it cannot flake.
+                      - --registry-map=ghcr.io=mirror-ghcr.registry.svc.cluster.local:5000
+                      - --build-arg=NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/
+                      - --build-arg=PIP_INDEX_URL=http://pip-cache.registry.svc.cluster.local/simple/
+                      - --build-arg=PIP_TRUSTED_HOST=pip-cache.registry.svc.cluster.local
+                      - --cache=true
+                      - --cache-repo=${REG}/kaniko-cache/id-deploy-${ARCH}
+                      - --cache-copy-layers=true
+                      - --cache-ttl=336h
+                      - --compressed-caching=false
+                    resources:
+                      # s1 is the sole amd64 builder and hosts a 26-CPU reserved
+                      # runtime. A realistic request avoids false queueing while
+                      # the 2-CPU limit still permits bursty layer snapshots.
+                      requests: { cpu: 25m, memory: 256Mi }
+                      limits: { cpu: 2, memory: 8Gi }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          }
+
+          # Launch both arch builds in parallel
+          BUILD_GUARD_CONFIGMAP="origin-ci-build-guard-650fec631781"
+          BUILD_GUARD_SHA256="650fec631781edce0e4980f0fb07b12ab78b67b1faf780b214d12a40f9dddcf6"
+          BUILD_GUARD="${RUNNER_TEMP:-/tmp}/origin-ci-build-guard.py"
+          kubectl get "configmap/${BUILD_GUARD_CONFIGMAP}" -n origin \
+            -o jsonpath='{.data.guard\.py}' >"$BUILD_GUARD"
+          echo "${BUILD_GUARD_SHA256}  ${BUILD_GUARD}" | sha256sum -c -
+          job_name_for_arch() {
+            local ARCH="$1"
+            render_build_job "$ARCH" | awk '$1 == "name:" { print $2; exit }'
+          }
+          AMD64_JOB="$(job_name_for_arch amd64)"
+          ARM64_JOB="$(job_name_for_arch arm64)"
+          test -n "$AMD64_JOB" -a -n "$ARM64_JOB"
+          cleanup_build_pair() {
+            python3 "$BUILD_GUARD" cleanup \
+              --namespace build --job "$AMD64_JOB" --job "$ARM64_JOB"
+          }
+          cleanup_on_failure() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then cleanup_build_pair || true; fi
+            exit "$rc"
+          }
+          trap cleanup_on_failure EXIT INT TERM
+          python3 "$BUILD_GUARD" preflight --arch amd64 --arch arm64
+          cleanup_build_pair
+          render_build_job amd64 | kubectl apply -f -
+          render_build_job arm64 | kubectl apply -f -
+          python3 "$BUILD_GUARD" wait-pair --namespace build \
+            --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
+            --timeout-seconds 1800
+          trap - EXIT INT TERM
+          # The build guard already captured both terminal completion receipts.
+          # A finished Job may be reaped while the other architecture builds.
+          echo "Both arch builds done."
+
+          # Combine into a multi-arch manifest list with crane
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-manifest-id-${SHORT}
+            namespace: build
+            labels: { app: ci-manifest, service: id, shizuha.io/orig-task: ORIG-7 }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 300
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: crane
+                    image: gcr.io/go-containerregistry/crane:latest
+                    # Image entrypoint IS the crane binary (distroless, no shell) — pass args directly.
+                    args:
+                      - index
+                      - append
+                      - --insecure
+                      - -t
+                      - ${REG}/shizuha-id:${TAG}
+                      - -m
+                      - ${REG}/shizuha-id:${TAG}-amd64
+                      - -m
+                      - ${REG}/shizuha-id:${TAG}-arm64
+          YAML
+          kubectl wait -n build --for=condition=complete "job/ci-manifest-id-${SHORT}" --timeout=300s || {
+            echo "::error::manifest combine failed"; kubectl logs -n build "job/ci-manifest-id-${SHORT}" --tail=30 || true; exit 1; }
+
+          # Deploy the multi-arch manifest list
+          verify_manifest() {
+            local REPO="$1"
+            local IMAGE_TAG="$2"
+            local JOB="ci-verify-${REPO}-${SHORT}"
+            cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-verify, service: id }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 180
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: manifest-check
+                    image: python:3.12-alpine
+                    command: ["python", "-c"]
+                    args:
+                      - |
+                        import json, urllib.request
+                        url = "http://${REG}/v2/${REPO}/manifests/${IMAGE_TAG}"
+                        accept = ",".join([
+                            "application/vnd.oci.image.index.v1+json",
+                            "application/vnd.docker.distribution.manifest.list.v2+json",
+                        ])
+                        req = urllib.request.Request(url, headers={"Accept": accept})
+                        with urllib.request.urlopen(req, timeout=30) as resp:
+                            manifest = json.load(resp)
+                        platforms = {
+                            f"{m.get('platform', {}).get('os')}/{m.get('platform', {}).get('architecture')}"
+                            for m in manifest.get("manifests", [])
+                        }
+                        missing = {"linux/amd64", "linux/arm64"} - platforms
+                        print(f"{url} platforms={sorted(platforms)}")
+                        if missing:
+                            raise SystemExit(f"missing required platform(s): {sorted(missing)}")
+          YAML
+            kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=120s || {
+              echo "::error::manifest verification failed"
+              kubectl logs -n build "job/${JOB}" --tail=80 || true
+              exit 1
+            }
+            kubectl logs -n build "job/${JOB}" --tail=20 || true
+          }
+          verify_manifest "shizuha-id" "${TAG}"
+
+  # Rollout gate: migration-gate already depends on the exact successful build.
+  deploy:
+    needs: [migration-gate]
+    concurrency:
+      group: deploy-id-build-${{ github.ref }}
+      cancel-in-progress: false
+    runs-on: deploy-lane
+    container:
+      image: registry.registry.svc.cluster.local:5000/origin-ci-helm@sha256:90f02d48d68c0ed690f9ddd8bcef1167490610362c19d429943931433ed7b194
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout exact triggering revision for monotonic release guard
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          # Pinned toolbox vendors the client; do not download it per job.
+          kubectl version --client -o json | python3 -c 'import json,sys; assert json.load(sys.stdin)["clientVersion"]["gitVersion"].split("+")[0] == "v1.34.6"'
+          helm version --short | grep -F 'v3.21.2'
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Deploy multi-arch image + verify
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          TAG="id-${SHORT}"
+          REG="registry.registry.svc.cluster.local:5000"
+          set +e
+          .forgejo/scripts/monotonic-release-guard.sh shizuha shizuha-id "${{ github.sha }}"
+          GUARD_RC="$?"
+          set -e
+          if [ "${GUARD_RC}" = 10 ]; then exit 0; fi
+          if [ "${GUARD_RC}" != 0 ]; then exit "${GUARD_RC}"; fi
+          # The deploy chart is the sole desired-state authority and the central
+          # lifecycle is the sole Helm writer. Split ownership here previously
+          # let an already-running lifecycle replay an older backend snapshot.
+          FGJO_URL="http://forgejo-http.origin.svc.cluster.local"
+          FGJO_HOST="origin.shizuha.com"
+          python3 .forgejo/scripts/test_deploy_values_path.py
+          python3 .forgejo/scripts/test_ci_dependency_transport.py
+          VALS_URL="${FGJO_URL}/api/v1/repos/shizuha-labs/deploy/contents/k3s%2Fcharts%2Fshizuha-id%2Fvalues.yaml"
+          PROMOTED=false
+          for write_attempt in 1 2 3 4 5; do
+            GET_CODE="$(curl -sS -o /tmp/id-backend-values.json -w '%{http_code}' \
+              -H "Host: ${FGJO_HOST}" \
+              -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+              "${VALS_URL}" || true)"
+            test "${GET_CODE}" = 200 || { echo "::error::deploy values GET returned HTTP ${GET_CODE}"; exit 1; }
+            FILE_SHA="$(python3 -c 'import json; print(json.load(open("/tmp/id-backend-values.json"))["sha"])')"
+            python3 -c 'import base64,json; open("/tmp/id-values.yaml","wb").write(base64.b64decode(json.load(open("/tmp/id-backend-values.json"))["content"]))'
+            CURRENT_BACKEND_TAG="$(python3 .forgejo/scripts/deploy-values-path.py get /tmp/id-values.yaml image.tag)"
+            if [ "${CURRENT_BACKEND_TAG}" = "${TAG}" ]; then
+              echo "deploy repo already desires ${TAG}"
+              break
+            fi
+            python3 .forgejo/scripts/deploy-values-path.py set /tmp/id-values.yaml image.tag "${TAG}" >/dev/null
+            NEW_B64="$(base64 -w0 /tmp/id-values.yaml)"
+            BODY="$(python3 -c "import json,sys; print(json.dumps({'message':'ci(shizuha-id): desired backend tag ${TAG} before rollout','content':sys.argv[1],'sha':'${FILE_SHA}','branch':'master','committer':{'email':'ci@shizuha.com','name':'Origin CI'}}))" "${NEW_B64}")"
+            PUT_CODE="$(curl -sS -o /tmp/id-backend-values-put.json -w '%{http_code}' \
+              -X PUT -H "Host: ${FGJO_HOST}" \
+              -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+              -H 'Content-Type: application/json' \
+              "${VALS_URL}" -d "${BODY}" || true)"
+            if printf '%s' "${PUT_CODE}" | grep -Eq '^(200|201)$'; then
+              PROMOTED=true
+              echo "deploy repo desired backend tag updated to ${TAG}"
+              break
+            fi
+            if [ "${PUT_CODE}" = 409 ] && [ "${write_attempt}" != 5 ]; then
+              echo "deploy values changed concurrently; retrying fresh read (${write_attempt}/5)"
+              sleep 2
+              continue
+            fi
+            echo "::error::deploy values PUT returned HTTP ${PUT_CODE}"; exit 1
+          done
+          GET_CODE="$(curl -sS -o /tmp/id-backend-values-final.json -w '%{http_code}' \
+            -H "Host: ${FGJO_HOST}" \
+            -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+            "${VALS_URL}" || true)"
+          test "${GET_CODE}" = 200 || { echo "::error::deploy values verification GET returned HTTP ${GET_CODE}"; exit 1; }
+          python3 -c 'import base64,json; open("/tmp/id-values-final.yaml","wb").write(base64.b64decode(json.load(open("/tmp/id-backend-values-final.json"))["content"]))'
+          FINAL_BACKEND_TAG="$(python3 .forgejo/scripts/deploy-values-path.py get /tmp/id-values-final.yaml image.tag)"
+          test "${FINAL_BACKEND_TAG}" = "${TAG}" || { echo "::error::deploy repo backend tag ${FINAL_BACKEND_TAG} != ${TAG}"; exit 1; }
+          # A rerun can find the canonical tag already promoted after a prior
+          # lifecycle failure. In that case there is no new chart commit to
+          # emit a push event, so explicitly request the same reconciler.
+          if [ "${PROMOTED}" != true ]; then
+            DISPATCH_CODE="$(curl -sS -o /tmp/id-backend-dispatch.json -w '%{http_code}' \
+              -X POST -H "Host: ${FGJO_HOST}" \
+              -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+              -H 'Content-Type: application/json' \
+              "${FGJO_URL}/api/v1/repos/shizuha-labs/deploy/actions/workflows/deploy-id-mail-lifecycle.yml/dispatches" \
+              -d '{"ref":"master"}' || true)"
+            test "${DISPATCH_CODE}" = 204 || { echo "::error::lifecycle dispatch returned HTTP ${DISPATCH_CODE}"; exit 1; }
+            echo "central lifecycle reconcile dispatched for existing desired tag ${TAG}"
+          fi
+
+          EXPECTED_IMAGE="localhost:30500/shizuha-id:${TAG}"
+          deployment_converged() {
+            kubectl get deploy -n shizuha "$1" -o json 2>/dev/null | python3 -c '
+          import json, sys
+          deployment = json.load(sys.stdin)
+          metadata, spec, status = deployment["metadata"], deployment["spec"], deployment.get("status", {})
+          replicas = spec.get("replicas", 1)
+          ok = (
+              status.get("observedGeneration", 0) >= metadata.get("generation", 0)
+              and status.get("updatedReplicas", 0) == replicas
+              and status.get("availableReplicas", 0) == replicas
+              and status.get("readyReplicas", 0) == replicas
+          )
+          raise SystemExit(0 if ok else 1)
+          '
+          }
+          # The lifecycle serially reconciles Mail, Pulse, then ID. Its normal
+          # bounded path can exceed 15 minutes even without a failure.
+          for attempt in $(seq 1 540); do
+            GET_CODE="$(curl -sS -o /tmp/id-backend-values-current.json -w '%{http_code}' \
+              -H "Host: ${FGJO_HOST}" \
+              -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+              "${VALS_URL}" || true)"
+            CURRENT_DESIRED_BACKEND=""
+            CURRENT_DESIRED_FRONTEND=""
+            if [ "${GET_CODE}" = 200 ]; then
+              python3 -c 'import base64,json; open("/tmp/id-values-current.yaml","wb").write(base64.b64decode(json.load(open("/tmp/id-backend-values-current.json"))["content"]))'
+              CURRENT_DESIRED_BACKEND="$(python3 .forgejo/scripts/deploy-values-path.py get /tmp/id-values-current.yaml image.tag)"
+              CURRENT_DESIRED_FRONTEND="$(python3 .forgejo/scripts/deploy-values-path.py get /tmp/id-values-current.yaml frontend.image.tag)"
+            fi
+            if [ -n "${CURRENT_DESIRED_BACKEND}" ] && [ "${CURRENT_DESIRED_BACKEND}" != "${TAG}" ]; then
+              echo "Backend desired state advanced to ${CURRENT_DESIRED_BACKEND}; this run is superseded"
+              exit 0
+            fi
+            EXPECTED_FRONTEND_IMAGE="localhost:30500/shizuha-id-frontend:${CURRENT_DESIRED_FRONTEND}"
+            LIVE="$(kubectl get deploy -n shizuha shizuha-id -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+            LIVE_FRONTEND_IMAGE="$(kubectl get deploy -n shizuha shizuha-id-frontend -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+            RELAY_LIVE="$(kubectl get deploy -n shizuha shizuha-id-lifecycle-relay -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+            STORED_BACKEND_TAG="$(helm get values shizuha-id -n shizuha -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("image",{}).get("tag",""))' || true)"
+            STORED_FRONTEND_TAG="$(helm get values shizuha-id -n shizuha -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("frontend",{}).get("image",{}).get("tag",""))' || true)"
+            if [ "${LIVE}" = "${EXPECTED_IMAGE}" ] \
+              && [ "${LIVE_FRONTEND_IMAGE}" = "${EXPECTED_FRONTEND_IMAGE}" ] \
+              && [ "${RELAY_LIVE}" = "${EXPECTED_IMAGE}" ] \
+              && [ "${STORED_BACKEND_TAG}" = "${TAG}" ] \
+              && [ -n "${CURRENT_DESIRED_FRONTEND}" ] \
+              && [ "${STORED_FRONTEND_TAG}" = "${CURRENT_DESIRED_FRONTEND}" ] \
+              && deployment_converged shizuha-id \
+              && deployment_converged shizuha-id-lifecycle-relay \
+              && deployment_converged shizuha-id-frontend; then
+              echo "Chart, Helm, API, relay, and frontend converged on attempt ${attempt}"
+              break
+            fi
+            # ORIG-11 (PLAT-10473 follow-up): a bare "did not converge" after
+            # 45 minutes is undiagnosable — emit every leg's live value so the
+            # stuck release leg is visible mid-run and in the failure body.
+            if [ $((attempt % 30)) = 0 ] || [ "${attempt}" = 540 ]; then
+              echo "convergence legs @ attempt ${attempt}: LIVE=${LIVE:-<unset>} EXPECTED=${EXPECTED_IMAGE} LIVE_FRONTEND=${LIVE_FRONTEND_IMAGE:-<unset>} EXPECTED_FRONTEND=${EXPECTED_FRONTEND_IMAGE} RELAY=${RELAY_LIVE:-<unset>} STORED_BACKEND=${STORED_BACKEND_TAG:-<unset>} DESIRED_FRONTEND=${CURRENT_DESIRED_FRONTEND:-<unset>} STORED_FRONTEND=${STORED_FRONTEND_TAG:-<unset>}"
+              for d in shizuha-id shizuha-id-lifecycle-relay shizuha-id-frontend; do
+                if deployment_converged "$d"; then
+                  echo "  ${d}: converged"
+                else
+                  echo "  ${d}: NOT converged $(kubectl get deploy -n shizuha "$d" -o jsonpath='[{.status.observedGeneration}/{.metadata.generation} gen, {.status.updatedReplicas}/{.spec.replicas} updated, {.status.readyReplicas}/{.spec.replicas} ready]' 2>/dev/null || echo '(kubectl get failed)')"
+                fi
+              done
+            fi
+            if [ "${attempt}" = 540 ]; then
+              echo "::error::central lifecycle did not converge ID release"; exit 1
+            fi
+            sleep 5
+          done
+
+          # PLAT-5342: a converged image does NOT mean the schema moved. A
+          # migration failure used to be invisible (supervisord exitcodes=0,1 +
+          # file logs). `migrate --check` exits non-zero when ANY migration is
+          # unapplied, turning silent divergence into a red deploy.
+          if ! kubectl exec -n shizuha deployment/shizuha-id -c shizuha-id -- \
+                 python manage.py migrate --check --noinput; then
+            echo "::error::unapplied migrations after deploy — schema did not converge"
+            kubectl logs -n shizuha deploy/shizuha-id -c shizuha-id --tail=60 | grep -iE "migrat|error|traceback|Applying" | tail -40 || true
+            exit 1
+          fi
+          echo "OK schema converged — no unapplied migrations"
+
+          # ID-61 / CTX-452: catch stale Helm user-values drift AND prove the
+          # exact live image mints RS256 across every OAuth grant. The source no
+          # longer honors a false flag, but keeping the value aligned for one
+          # rollback release ensures the immediately-previous image is safe too.
+          RS256_ENV="$(kubectl get deploy -n shizuha shizuha-id -o jsonpath='{range .spec.template.spec.containers[?(@.name=="shizuha-id")].env[?(@.name=="SHIZUHA_OAUTH_RS256")]}{.value}{end}')"
+          [ "${RS256_ENV}" = "true" ] || { echo "::error::live SHIZUHA_OAUTH_RS256=${RS256_ENV:-missing}, expected true"; exit 1; }
+          kubectl exec -n shizuha deployment/shizuha-id -c shizuha-id -- \
+            python manage.py verify_oauth_rs256_invariant
+          # Mail is an identity-owned default capability for every human and
+          # agent. Reconcile additively on every release so legacy/direct
+          # activation paths cannot leave a physical mailbox inaccessible.
+          kubectl exec -n shizuha deployment/shizuha-id -c shizuha-id -- \
+            python manage.py reconcile_service_grants
+          RECONCILE_DRY_RUN="$(kubectl exec -n shizuha deployment/shizuha-id -c shizuha-id -- \
+            python manage.py reconcile_service_grants --dry-run)"
+          grep -Fq 'Would add 0 grant(s)' <<<"${RECONCILE_DRY_RUN}"
+          kubectl annotate -n shizuha deploy/shizuha-id shizuha.io/last-successful-sha="${{ github.sha }}" --overwrite
