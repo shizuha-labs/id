@@ -33,11 +33,12 @@ User = get_user_model()
 #   - cache HIT  -> use it.
 #   - cache MISS or cache backend DOWN -> fall through to the DB (which is itself
 #     fail-closed: a DB error propagates as a 401, never an allow-through).
-#   - the revoke path WRITE-THROUGHS the new cutoff (prime_user_access_cutoff_cache)
-#     so enforcement is immediate, not gated on TTL expiry.
+#   - the revoke path invalidates this cache at the outer transaction's commit,
+#     so rolled-back cutoffs never become authority and late callbacks cannot
+#     overwrite a newer committed cutoff with an older captured timestamp.
 # `_NO_CUTOFF_SENTINEL` lets us cache the (common) "no cutoff" answer too — without
 # it every normal-user request would still hit the DB. With a SHARED cache backend
-# (Redis/memcached) revocation is effective fleet-wide immediately via write-through;
+# (Redis/memcached) commit invalidation is effective fleet-wide immediately;
 # with the default per-process LocMemCache, a worker that cached "no cutoff" before a
 # logout on ANOTHER worker is bounded by ID13_ACCESS_CUTOFF_CACHE_TTL (default 60s),
 # still a vast improvement over the full access-token TTL the cutoff replaces.
@@ -55,10 +56,11 @@ def _access_cutoff_cache_ttl():
 
 
 def prime_user_access_cutoff_cache(user_id, cutoff):
-    """ID-13: write-through the user's cutoff into the cache (called by the revoke
-    path right after the DB bump) so the new cutoff is enforced immediately rather
-    than after the previous cache entry's TTL. Best-effort: a cache failure here is
-    non-fatal because reads fall back to the authoritative DB."""
+    """Write through an already-authoritative cutoff (legacy compatibility API).
+
+    Transactional revocation uses commit-time invalidation instead; publishing a
+    captured cutoff before outer commit would leak rolled-back authority.
+    """
     if not user_id:
         return
     try:
@@ -67,6 +69,22 @@ def prime_user_access_cutoff_cache(user_id, cutoff):
             cutoff if cutoff is not None else _NO_CUTOFF_SENTINEL,
             _access_cutoff_cache_ttl(),
         )
+    except Exception:
+        pass
+
+
+def invalidate_user_access_cutoff_cache(user_id):
+    """Discard cached authority after commit; the next read loads the current DB.
+
+    Invalidation carries no timestamp, so an earlier transaction's delayed
+    callback cannot replace a later committed cutoff with an older value.
+    Cache failures retain the existing best-effort cache/authoritative DB read
+    contract; no post-commit exception can misreport a durable revocation.
+    """
+    if not user_id:
+        return
+    try:
+        cache.delete(_access_cutoff_cache_key(user_id))
     except Exception:
         pass
 

@@ -168,15 +168,18 @@ class Id65LogoutBlacklistTests(APITestCase):
         user = self._user('id70password')
         a, b, _sid_a, _sid_b = self._two_sessions(user.username)
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {a['access']}")
-        response = self.client.post(
-            PASSWORD_CHANGE,
-            {
-                'old_password': 'Pass123!x',
-                'new_password': 'AnotherPass456!y',
-                'new_password2': 'AnotherPass456!y',
-            },
-            format='json',
-        )
+        # TestCase wraps this request in an outer transaction; execute its
+        # committed revocation callback before probing either prior session.
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                PASSWORD_CHANGE,
+                {
+                    'old_password': 'Pass123!x',
+                    'new_password': 'AnotherPass456!y',
+                    'new_password2': 'AnotherPass456!y',
+                },
+                format='json',
+            )
         self.assertEqual(response.status_code, 200, response.content)
         self.assertGreaterEqual(self._userinfo(a['access']).status_code, 400)
         self.assertGreaterEqual(self._userinfo(b['access']).status_code, 400)

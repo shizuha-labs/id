@@ -1579,9 +1579,10 @@ class InternalTestTenantDeprovisionView(APIView):
     golden-path harness to QA_FIXTURE_SIGNUP_DOMAIN, HIVE-2697 ruling 2:
     saga-parked tenants must deprovision cleanly) AND non-staff/non-superuser
     AND a person account.
-    Hard-deletes (test fixtures must not accumulate); the deprovision itself
-    is recorded in the hash-chained AdminAuditEvent ledger, which survives
-    the user-row cascade. Threat model: HIVE-444 task record (STRIDE-lite).
+    Uses the sanctioned terminal DELETED lifecycle, including token revocation.
+    Identity and all financial/grant/history rows remain retained; this is not
+    hard-purge authority. The deprovision is recorded in AdminAuditEvent and the
+    lifecycle audit/outbox. Threat model: HIVE-444 task record (STRIDE-lite).
     """
     authentication_classes = []
     permission_classes = [permissions.AllowAny]
@@ -1612,51 +1613,60 @@ class InternalTestTenantDeprovisionView(APIView):
         if not ok:
             return response
 
-        try:
-            user = User.objects.get(id=user_id)
-        except User.DoesNotExist:
-            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
-
-        email = (user.email or '').strip().lower()
-        account_type = getattr(getattr(user, 'profile', None), 'account_type', '') or ''
-        # The hard test-tenant predicate — refuse-by-default. Every condition
-        # must hold; a real user can never satisfy the test domain, and even a
-        # mis-created test account with elevated bits is refused.
-        if (
-            not email.endswith(self._test_tenant_domains())
-            or user.is_staff
-            or user.is_superuser
-            or account_type == 'agent'
-        ):
-            logger.warning(
-                'HIVE-444 deprovision REFUSED for user %s (%s): not a test tenant '
-                '(domain=%s staff=%s superuser=%s account_type=%s)',
-                user_id, email, email.endswith(self._test_tenant_domains()),
-                user.is_staff, user.is_superuser, account_type,
-            )
-            return Response(
-                {'error': 'Target is not a test tenant'},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        from .models import AdminAuditEvent
-        username = user.username
         from django.db import transaction as db_transaction
-        with db_transaction.atomic():
-            AdminAuditEvent.objects.append(
-                action='test_tenant.deprovision',
-                actor=None,
-                target_type='user',
-                target_id=user.id,
-                target_repr=f'{username} <{email}>',
-                before={'email': email, 'username': username},
-                request_metadata={'service': 'validation-runtime', 'endpoint': 'internal-test-tenant-deprovision'},
-            )
-            revoke_all_user_tokens(user)
-            user.delete()
+        from .lifecycle import LifecycleState, derive_lifecycle_state, transition_user
+        from .models import AdminAuditEvent
 
-        logger.info('HIVE-444 deprovisioned test tenant %s (%s)', username, email)
-        return Response({'message': f'Test tenant "{username}" deprovisioned', 'id': user_id})
+        with db_transaction.atomic():
+            try:
+                user = User.objects.select_for_update().get(id=user_id)
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+            profile = UserProfile.objects.select_for_update().filter(user=user).first()
+            email = (user.email or '').strip().lower()
+            account_type = getattr(profile, 'account_type', '') or ''
+            # Recheck the complete existing predicate while the subject rows are
+            # locked. This credential never grants general lifecycle authority.
+            if (
+                not email.endswith(self._test_tenant_domains())
+                or user.is_staff
+                or user.is_superuser
+                or account_type == 'agent'
+            ):
+                logger.warning('HIVE-444 deprovision REFUSED for user %s: not a test tenant', user_id)
+                return Response({'error': 'Target is not a test tenant'}, status=status.HTTP_403_FORBIDDEN)
+
+            username = user.username
+            before_state = getattr(profile, 'lifecycle_state', '') or derive_lifecycle_state(
+                getattr(profile, 'approval_status', 'pending'), user.is_active,
+            )
+            already_deprovisioned = before_state == LifecycleState.DELETED
+            if already_deprovisioned:
+                if user.is_active or not profile.access_revoked_before:
+                    return Response({'error': 'Terminal lifecycle revocation is not established'},
+                                    status=status.HTTP_409_CONFLICT)
+            else:
+                # Pending identities have no direct delete edge. Deny the scoped
+                # disposable fixture through the FSM, then take its legal terminal
+                # edge; the outer transaction covers both steps and revocation.
+                if before_state == LifecycleState.PENDING:
+                    transition_user(user, LifecycleState.DENIED, actor=None,
+                                    reason='validation-runtime cleanup: deny pending test tenant')
+                transition_user(user, LifecycleState.DELETED, actor=None,
+                                reason='validation-runtime cleanup: terminally deprovision test tenant')
+                AdminAuditEvent.objects.append(
+                    action='test_tenant.deprovision', actor=None,
+                    target_type='user', target_id=user.id,
+                    target_repr=f'{username} <{email}>',
+                    before={'email': email, 'username': username, 'lifecycle_state': before_state},
+                    after={'lifecycle_state': LifecycleState.DELETED, 'identity_retained': True},
+                    request_metadata={'service': 'validation-runtime', 'endpoint': 'internal-test-tenant-deprovision'},
+                )
+
+        logger.info('HIVE-444 terminally deprovisioned test tenant %s', user_id)
+        return Response({'message': f'Test tenant "{username}" deprovisioned', 'id': user_id,
+                         'lifecycle_state': LifecycleState.DELETED, 'identity_retained': True,
+                         'already_deprovisioned': already_deprovisioned})
 
 
 class InternalHumanDirectoryView(APIView):
