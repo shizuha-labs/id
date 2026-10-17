@@ -879,8 +879,13 @@ def revoke_all_user_tokens(user):
     if pushes_purged:
         logger.info(f"revoke_all_user_tokens: deactivated {pushes_purged} push token(s) for user {user.id}")
     # Write-through the cache so enforcement is immediate, not gated on TTL expiry.
-    from .authentication import prime_user_access_cutoff_cache
-    prime_user_access_cutoff_cache(user.id, now)
+    from .authentication import invalidate_user_access_cutoff_cache
+    # A surrounding lifecycle/audit transaction may still roll back. Publish
+    # only the durable boundary, and invalidate instead of replaying an older
+    # timestamp if this callback runs after a newer revocation has committed.
+    transaction.on_commit(
+        lambda user_id=user.id: invalidate_user_access_cutoff_cache(user_id)
+    )
     try:
         from rest_framework_simplejwt.token_blacklist.models import (
             OutstandingToken, BlacklistedToken,
