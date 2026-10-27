@@ -15,6 +15,13 @@ jobs:
       - name: Install kubectl + cluster access
         run: |
           set -euo pipefail
+          # PLAT-12291: fork PRs do not receive repository secrets. An empty
+          # kubeconfig makes kubectl dial [::1]:8080 and fail in ~3s, then
+          # needs: dependents stay pending. Skip loudly instead of crashing.
+          if [ -z "${{ secrets.KUBE_CONFIG_B64 }}" ]; then
+            echo '::notice::fork PR: repo secrets unavailable, skipping cluster-gated step'
+            exit 0
+          fi
           KUBECTL_ARCH="$(uname -m)"; case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; *) echo "Unsupported runner arch: $KUBECTL_ARCH" >&2; exit 1;; esac
           curl -fsSL -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
           install -m 0755 kubectl /usr/local/bin/kubectl
@@ -24,6 +31,10 @@ jobs:
       - name: Run full Django test + migration gate before merge
         run: |
           set -euo pipefail
+          if [ -z "${{ secrets.KUBE_CONFIG_B64 }}" ]; then
+            echo '::notice::fork PR: repo secrets unavailable, skipping cluster-gated step'
+            exit 0
+          fi
           SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
           JOB="ci-migration-gate-id-${SHORT}"
           kubectl delete job -n build "${JOB}" --ignore-not-found
