@@ -1,7 +1,10 @@
 # Shizuha Origin CI/CD — MULTI-ARCH build + deploy id (ORIG-7 Plan A).
 # Lives in the id repo; triggers on its own pushes (synced GitHub->Origin every 5m).
-# Builds id for BOTH amd64 + arm64 via two in-cluster kaniko Jobs (arch-matched nodes),
-# combines them into a multi-arch manifest list with crane, deploys the list, and verifies.
+# Builds id per architecture via in-cluster kaniko Jobs (arch-matched nodes) for every
+# arch that currently has an admissible node (amd64 + arm64 normally; arm64 is required,
+# a skipped arch is a ::warning::), combines them into a manifest list with crane,
+# verifies the list equals the built set, and refuses a rollout whose platforms do not
+# cover the nodes running the Deployment's pods (.forgejo/scripts/build_arches.py).
 # Multi-arch = the image runs on any platform node (s1 amd64 OR gx10 arm64) per PLAT-718 —
 # no single-arch regression / exec-format crashes. Auth = KUBE_CONFIG_B64 org secret
 # (least-privilege origin-ci-deployer SA). No submodule checkout, no docker-in-DinD.
@@ -48,6 +51,8 @@ jobs:
       run:
         shell: bash
     steps:
+      - name: Checkout exact triggering revision (arch helpers)
+        uses: actions/checkout@v4
       - name: Install kubectl + cluster access
         run: |
           set -euo pipefail
@@ -63,6 +68,14 @@ jobs:
           SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
           JOB="ci-migration-gate-id-${SHORT}"
           TAG="id-${SHORT}"
+          # The gate runs the candidate image: schedule it only on node arches the
+          # image index actually contains (a single-arch build must not land on
+          # another arch and die with exec format error).
+          python3 .forgejo/scripts/build_arches.py manifest-platforms \
+            --registry registry.registry.svc.cluster.local:5000 --repo shizuha-id --tag "${TAG}" \
+            --job-name "ci-verify-shizuha-id-${SHORT}-gate" --label service=id \
+            --output /tmp/id-image-arches.txt
+          IMAGE_ARCHES_CSV="$(sed 's/ /, /g' /tmp/id-image-arches.txt)"
           # Forgejo cancellation cannot own or terminate Jobs created through
           # kubectl. Concurrency guarantees only this revision is authoritative,
           # so reap every superseded ID gate before creating the current one.
@@ -82,6 +95,13 @@ jobs:
             template:
               spec:
                 restartPolicy: Never
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        # Only nodes whose arch the candidate image was built for.
+                        - { key: kubernetes.io/arch, operator: In, values: [${IMAGE_ARCHES_CSV}] }
                 # Native sidecars are stable in Kubernetes 1.33. They give the
                 # candidate isolated test services without installing 300MiB of
                 # Debian packages on every commit, and do not block Job completion.
@@ -193,6 +213,8 @@ jobs:
       run:
         shell: bash
     steps:
+      - name: Checkout exact triggering revision (arch helpers)
+        uses: actions/checkout@v4
       - name: Install kubectl + cluster access
         run: |
           set -euo pipefail
@@ -211,7 +233,7 @@ jobs:
           NPM_CONFIG_REGISTRY="${NPM_CONFIG_REGISTRY:-http://npm-cache.registry.svc.cluster.local:4873/}"
           PIP_INDEX_URL="${PIP_INDEX_URL:-http://pip-cache.registry.svc.cluster.local/simple/}"
           PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-pip-cache.registry.svc.cluster.local}"
-          echo "Multi-arch build shizuha-id:${TAG} (amd64 + arm64)"
+          echo "Arch-aware build shizuha-id:${TAG} (candidates: amd64 arm64)"
 
           # Action cancellation does not propagate to Jobs created through
           # kubectl. Reap only this workflow's prior backend build artifacts;
@@ -340,12 +362,35 @@ jobs:
             local ARCH="$1"
             render_build_job "$ARCH" | awk '$1 == "name:" { print $2; exit }'
           }
-          AMD64_JOB="$(job_name_for_arch amd64)"
-          ARM64_JOB="$(job_name_for_arch arm64)"
-          test -n "$AMD64_JOB" -a -n "$ARM64_JOB"
+          # Arch-aware build set (.forgejo/scripts/build_arches.py): build only the
+          # architectures that have a Ready, schedulable node admitting the
+          # rendered build Job (nodeSelector/affinity/taints). arm64 is required;
+          # a skipped arch is reported as ::warning:: and the build returns to
+          # multi-arch automatically once such a node is admissible again.
+          python3 .forgejo/scripts/test_build_arches.py 2>&1 | tail -3
+          ARCH_DIR="$(mktemp -d)"
+          for ARCH in amd64 arm64; do
+            render_build_job "$ARCH" | kubectl create --dry-run=client -o json -f - >"${ARCH_DIR}/job-${ARCH}.json"
+          done
+          python3 .forgejo/scripts/build_arches.py select \
+            --candidate "amd64=${ARCH_DIR}/job-amd64.json" \
+            --candidate "arm64=${ARCH_DIR}/job-arm64.json" \
+            --require arm64 --output "${ARCH_DIR}/build-arches.txt"
+          read -r -a BUILD_ARCHES <"${ARCH_DIR}/build-arches.txt"
+          test "${#BUILD_ARCHES[@]}" -ge 1
+          ALL_BUILD_JOBS=()
+          BUILD_WAIT_JOBS=()
+          PREFLIGHT_ARCHES=()
+          for ARCH in amd64 arm64; do
+            ALL_BUILD_JOBS+=(--job "$(job_name_for_arch "$ARCH")")
+          done
+          for ARCH in "${BUILD_ARCHES[@]}"; do
+            BUILD_WAIT_JOBS+=(--job "${ARCH}=$(job_name_for_arch "$ARCH")")
+            PREFLIGHT_ARCHES+=(--arch "$ARCH")
+          done
           cleanup_build_pair() {
-            python3 "$BUILD_GUARD" cleanup \
-              --namespace build --job "$AMD64_JOB" --job "$ARM64_JOB"
+            # Reap every candidate arch (a stale job of a now-skipped arch too).
+            python3 "$BUILD_GUARD" cleanup --namespace build "${ALL_BUILD_JOBS[@]}"
           }
           cleanup_on_failure() {
             rc=$?
@@ -353,19 +398,20 @@ jobs:
             exit "$rc"
           }
           trap cleanup_on_failure EXIT INT TERM
-          python3 "$BUILD_GUARD" preflight --arch amd64 --arch arm64
+          python3 "$BUILD_GUARD" preflight "${PREFLIGHT_ARCHES[@]}"
           cleanup_build_pair
-          render_build_job amd64 | kubectl apply -f -
-          render_build_job arm64 | kubectl apply -f -
-          python3 "$BUILD_GUARD" wait-pair --namespace build \
-            --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
+          for ARCH in "${BUILD_ARCHES[@]}"; do
+            render_build_job "$ARCH" | kubectl apply -f -
+          done
+          python3 "$BUILD_GUARD" wait-jobs --namespace build "${BUILD_WAIT_JOBS[@]}" \
             --timeout-seconds 1800
           trap - EXIT INT TERM
           # The build guard already captured both terminal completion receipts.
           # A finished Job may be reaped while the other architecture builds.
-          echo "Both arch builds done."
+          echo "Arch builds done: ${BUILD_ARCHES[*]}"
 
-          # Combine into a multi-arch manifest list with crane
+          # Combine the built per-arch images into a manifest list with crane
+          CRANE_MANIFEST_ARGS="$(for ARCH in "${BUILD_ARCHES[@]}"; do printf '            - -m\n            - %s\n' "${REG}/shizuha-id:${TAG}-${ARCH}"; done)"
           cat <<YAML | kubectl apply -f -
           apiVersion: batch/v1
           kind: Job
@@ -390,65 +436,16 @@ jobs:
                       - --insecure
                       - -t
                       - ${REG}/shizuha-id:${TAG}
-                      - -m
-                      - ${REG}/shizuha-id:${TAG}-amd64
-                      - -m
-                      - ${REG}/shizuha-id:${TAG}-arm64
+          ${CRANE_MANIFEST_ARGS}
           YAML
           kubectl wait -n build --for=condition=complete "job/ci-manifest-id-${SHORT}" --timeout=300s || {
             echo "::error::manifest combine failed"; kubectl logs -n build "job/ci-manifest-id-${SHORT}" --tail=30 || true; exit 1; }
 
-          # Deploy the multi-arch manifest list
-          verify_manifest() {
-            local REPO="$1"
-            local IMAGE_TAG="$2"
-            local JOB="ci-verify-${REPO}-${SHORT}"
-            cat <<YAML | kubectl apply -f -
-          apiVersion: batch/v1
-          kind: Job
-          metadata:
-            name: ${JOB}
-            namespace: build
-            labels: { app: ci-verify, service: id }
-          spec:
-            backoffLimit: 0
-            activeDeadlineSeconds: 180
-            ttlSecondsAfterFinished: 300
-            template:
-              spec:
-                restartPolicy: Never
-                containers:
-                  - name: manifest-check
-                    image: python:3.12-alpine
-                    command: ["python", "-c"]
-                    args:
-                      - |
-                        import json, urllib.request
-                        url = "http://${REG}/v2/${REPO}/manifests/${IMAGE_TAG}"
-                        accept = ",".join([
-                            "application/vnd.oci.image.index.v1+json",
-                            "application/vnd.docker.distribution.manifest.list.v2+json",
-                        ])
-                        req = urllib.request.Request(url, headers={"Accept": accept})
-                        with urllib.request.urlopen(req, timeout=30) as resp:
-                            manifest = json.load(resp)
-                        platforms = {
-                            f"{m.get('platform', {}).get('os')}/{m.get('platform', {}).get('architecture')}"
-                            for m in manifest.get("manifests", [])
-                        }
-                        missing = {"linux/amd64", "linux/arm64"} - platforms
-                        print(f"{url} platforms={sorted(platforms)}")
-                        if missing:
-                            raise SystemExit(f"missing required platform(s): {sorted(missing)}")
-          YAML
-            kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=120s || {
-              echo "::error::manifest verification failed"
-              kubectl logs -n build "job/${JOB}" --tail=80 || true
-              exit 1
-            }
-            kubectl logs -n build "job/${JOB}" --tail=20 || true
-          }
-          verify_manifest "shizuha-id" "${TAG}"
+          # The pushed index must contain exactly the architectures just built.
+          python3 .forgejo/scripts/build_arches.py manifest-platforms \
+            --registry "${REG}" --repo shizuha-id --tag "${TAG}" \
+            --job-name "ci-verify-shizuha-id-${SHORT}" --label service=id \
+            --expect "${BUILD_ARCHES[*]}"
 
   # Rollout gate: migration-gate already depends on the exact successful build.
   deploy:
@@ -488,6 +485,17 @@ jobs:
           set -e
           if [ "${GUARD_RC}" = 10 ]; then exit 0; fi
           if [ "${GUARD_RC}" != 0 ]; then exit "${GUARD_RC}"; fi
+          # Never roll an image that cannot run where the pods are: its platforms
+          # must cover the arch of every node running (non-terminating) pods of
+          # the Deployments that use it.
+          python3 .forgejo/scripts/test_build_arches.py 2>&1 | tail -3
+          python3 .forgejo/scripts/build_arches.py manifest-platforms \
+            --registry "${REG}" --repo shizuha-id --tag "${TAG}" \
+            --job-name "ci-verify-shizuha-id-${SHORT}-rollout" --label service=id \
+            --output /tmp/id-image-arches.txt
+          python3 .forgejo/scripts/build_arches.py check-placement \
+            --platforms "$(cat /tmp/id-image-arches.txt)" \
+            --deployment shizuha/shizuha-id --deployment shizuha/shizuha-id-lifecycle-relay
           # The deploy chart is the sole desired-state authority and the central
           # lifecycle is the sole Helm writer. Split ownership here previously
           # let an already-running lifecycle replay an older backend snapshot.

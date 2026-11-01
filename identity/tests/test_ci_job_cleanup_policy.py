@@ -31,16 +31,14 @@ class CiJobCleanupPolicyTests(unittest.TestCase):
                         "image: gcr.io/kaniko-project/executor:v1.23.2"
                     ),
                 )
-                if name == "deploy.yml":
-                    # The shared guard captures both terminal receipts before
-                    # their Job TTL can expire. Re-reading completed Jobs
-                    # afterwards manufactures NotFound failures.
-                    self.assertIn('python3 "$BUILD_GUARD" wait-pair', workflow)
-                    self.assertIn('--job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}"', workflow)
-                    self.assertNotIn("wait_job ", workflow)
-                else:
-                    self.assertIn("wait_job amd64 &", workflow)
-                    self.assertIn("wait_job arm64 &", workflow)
+                # The shared guard captures every selected arch's terminal
+                # receipt before its Job TTL can expire (build_arches.py picks
+                # the arch set). Re-reading completed Jobs afterwards
+                # manufactures NotFound failures, so neither workflow does.
+                self.assertIn('python3 "$BUILD_GUARD" wait-jobs --namespace build "${BUILD_WAIT_JOBS[@]}"', workflow)
+                self.assertIn('BUILD_WAIT_JOBS+=(--job "${ARCH}=$(job_name_for_arch "$ARCH")")', workflow)
+                self.assertNotIn("wait-pair", workflow)
+                self.assertNotIn("wait_job", workflow)
                 self.assertNotRegex(
                     workflow, r"(?m)^\s*wait_job (?:amd64|arm64)$"
                 )

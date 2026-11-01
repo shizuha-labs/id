@@ -86,10 +86,12 @@ class CiDependencyTransportTests(unittest.TestCase):
             with self.subTest(frontend_job=frontend_job):
                 self.assertIsNone(re.fullmatch(backend_job_pattern, frontend_job))
         self.assertIn('kubectl delete -n build "${STALE_ID_JOBS[@]}"', deploy)
-        self.assertEqual(deploy.count("activeDeadlineSeconds:"), 4)
+        # gate 1200, build 1800, manifest 300; the verify Job is rendered by
+        # build_arches.py manifest-platforms (bounded there, asserted below).
+        self.assertEqual(deploy.count("activeDeadlineSeconds:"), 3)
         self.assertIn("activeDeadlineSeconds: 1800", deploy)
         self.assertIn("activeDeadlineSeconds: 300", deploy)
-        self.assertIn("activeDeadlineSeconds: 180", deploy)
+        self.assert_verify_job_is_bounded(deploy)
         self.assertIn("  deploy:\n    needs: [migration-gate]", deploy)
 
     def test_frontend_build_jobs_are_bounded_and_reap_superseded_runs(self) -> None:
@@ -102,10 +104,18 @@ class CiDependencyTransportTests(unittest.TestCase):
         self.assertIn(
             'kubectl delete -n build "${STALE_ID_FRONTEND_JOBS[@]}"', frontend
         )
-        self.assertEqual(frontend.count("activeDeadlineSeconds:"), 3)
+        self.assertEqual(frontend.count("activeDeadlineSeconds:"), 2)
         self.assertIn("activeDeadlineSeconds: 1800", frontend)
         self.assertIn("activeDeadlineSeconds: 300", frontend)
-        self.assertIn("activeDeadlineSeconds: 180", frontend)
+        self.assert_verify_job_is_bounded(frontend)
+
+    def assert_verify_job_is_bounded(self, workflow: str) -> None:
+        self.assertIn(".forgejo/scripts/build_arches.py manifest-platforms", workflow)
+        self.assertNotIn("--timeout-seconds", workflow.split("manifest-platforms", 1)[1].split("\n\n", 1)[0])
+        helper = (ROOT / ".forgejo/scripts/build_arches.py").read_text()
+        self.assertIn('man.add_argument("--timeout-seconds", type=int, default=180)', helper)
+        self.assertIn('"activeDeadlineSeconds": args.timeout_seconds', helper)
+        self.assertIn('"ttlSecondsAfterFinished": 300', helper)
 
     def test_build_jobs_fit_the_reserved_amd64_node(self) -> None:
         deploy = DEPLOY.read_text()
