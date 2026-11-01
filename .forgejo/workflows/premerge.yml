@@ -135,6 +135,8 @@ jobs:
                         # username lookups when sys.argv[1]=='test', so the cortex
                         # Django gate does not resolve that short name. No cortex
                         # FQDN override in this change.
+                        # Arch-aware deploy helper + workflow contract (pure stdlib).
+                        python .forgejo/scripts/test_build_arches.py
                         python manage.py makemigrations --check --dry-run
                         python .forgejo/scripts/check-django-migration-graph.py
                         echo "== ID-68 default-on full identity suite with exact failure ratchet =="
